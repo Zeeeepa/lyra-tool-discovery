@@ -1,6 +1,15 @@
 import { GitHubSource } from './sources/github.js';
 import { NpmSource } from './sources/npm.js';
+import { PyPISource } from './sources/pypi.js';
 import { AIAnalyzer, type AIConfig } from './ai.js';
+import {
+  CATEGORIES,
+  resolveCategories,
+  mergeSearchTerms,
+  mergeRelevanceKeywords,
+  getGeneralSearchTerms,
+  type Category,
+} from './categories.js';
 import type { 
   DiscoveredTool, 
   DiscoveryResult, 
@@ -11,55 +20,98 @@ import type {
 
 export interface DiscoveryOptions {
   sources?: DiscoverySource[];
+  /** One or more category ids (e.g. 'research', 'database'). Omit or pass 'all' for general search. */
+  category?: string | string[];
+  /** Custom search keywords – overrides category search terms when provided */
+  keywords?: string[];
   limit?: number;
   dryRun?: boolean;
   outputDir?: string;
   maxAgeMonths?: number;
+  /** When true, skip the post-search relevance filter (useful with custom keywords) */
+  skipFilter?: boolean;
 }
-
-// Crypto/DeFi/blockchain/web3 keywords for filtering
-const CRYPTO_KEYWORDS = [
-  'crypto', 'cryptocurrency', 'defi', 'blockchain', 'web3',
-  'ethereum', 'eth', 'solana', 'sol', 'bitcoin', 'btc',
-  'wallet', 'token', 'nft', 'dex', 'swap', 'staking',
-  'yield', 'bridge', 'chain', 'smart contract', 'erc20',
-  'erc721', 'uniswap', 'aave', 'compound', 'lending',
-  'liquidity', 'vault', 'protocol', 'onchain', 'on-chain',
-  'web3.js', 'ethers', 'viem', 'wagmi', 'rainbowkit'
-];
 
 export class ToolDiscovery {
   private github: GitHubSource;
   private npm: NpmSource;
+  private pypi: PyPISource;
   private ai: AIAnalyzer;
   
   constructor(aiConfig?: AIConfig) {
     this.github = new GitHubSource();
     this.npm = new NpmSource();
+    this.pypi = new PyPISource();
     this.ai = new AIAnalyzer(aiConfig);
   }
   
   /**
-   * Discover crypto/DeFi/blockchain/web3 tools from configured sources
+   * Discover MCP tools from configured sources, optionally filtered by category.
+   *
+   * Examples:
+   *   discover()                                      // general MCP discovery
+   *   discover({ category: 'research' })              // research MCP servers
+   *   discover({ category: ['database', 'etl'] })     // database + ETL
+   *   discover({ keywords: ['rag', 'retrieval'] })    // custom keyword search
    */
   async discover(options: DiscoveryOptions = {}): Promise<DiscoveryResult[]> {
     const {
-      sources = ['github', 'npm'],
+      sources = ['github', 'npm', 'pypi'],
+      category,
+      keywords,
       limit = 10,
       dryRun = false,
-      maxAgeMonths = 12
+      maxAgeMonths = 12,
+      skipFilter = false,
     } = options;
-    
-    console.log(`🔍 Discovering crypto/DeFi/web3 tools from: ${sources.join(', ')}`);
-    console.log(`📅 Max age: ${maxAgeMonths} months`);
+
+    // ── Resolve search terms & relevance keywords ──────────────────
+    let searchTerms: string[];
+    let relevanceKeywords: string[] | null = null;
+    let resolvedCategories: Category[] = [];
+    let categoryLabel = 'all';
+
+    if (keywords && keywords.length > 0) {
+      // Custom keywords override category
+      searchTerms = keywords;
+      categoryLabel = `custom(${keywords.slice(0, 3).join(',')})`;
+      // No relevance filter for custom keywords unless user wants it
+      if (!skipFilter) {
+        relevanceKeywords = keywords.map(k => k.toLowerCase());
+      }
+    } else if (category && category !== 'all') {
+      resolvedCategories = resolveCategories(category);
+      if (resolvedCategories.length === 0) {
+        console.error('❌ No valid categories resolved. Falling back to general search.');
+        searchTerms = getGeneralSearchTerms();
+      } else {
+        searchTerms = mergeSearchTerms(resolvedCategories);
+        relevanceKeywords = mergeRelevanceKeywords(resolvedCategories);
+        categoryLabel = resolvedCategories.map(c => c.name).join(', ');
+      }
+    } else {
+      // "all" — general MCP discovery, no category filter
+      searchTerms = getGeneralSearchTerms();
+    }
+
+    console.log(`🔍 Discovering MCP tools [${categoryLabel}] from: ${sources.join(', ')}`);
+    console.log(`📅 Max age: ${maxAgeMonths} months | Search terms: ${searchTerms.slice(0, 6).join(', ')}${searchTerms.length > 6 ? '…' : ''}`);
     
     const tools: DiscoveredTool[] = [];
     
-    // Collect from each source
+    // ── Collect from each source ───────────────────────────────────
     for (const source of sources) {
       try {
-        const discovered = await this.discoverFromSource(source, limit, maxAgeMonths);
+        const discovered = await this.discoverFromSource(source, searchTerms, limit, maxAgeMonths);
         console.log(`  Found ${discovered.length} from ${source}`);
+
+        // Tag tools with resolved categories
+        if (resolvedCategories.length > 0) {
+          for (const t of discovered) {
+            t.categories = resolvedCategories.map(c => c.id);
+          }
+        }
+
         tools.push(...discovered);
       } catch (error) {
         console.error(`  Error from ${source}:`, error);
@@ -72,15 +124,18 @@ export class ToolDiscovery {
       return [];
     }
     
-    // Filter to only crypto-related tools
-    const cryptoTools = tools.filter(t => this.isCryptoRelated(t));
-    console.log(`🪙 Crypto-related: ${cryptoTools.length} tools`);
-    
-    // Filter to only tools with MCP support
-    const mcpTools = cryptoTools.filter(t => t.hasMCPSupport);
+    // ── Relevance filter ───────────────────────────────────────────
+    let filtered = tools;
+    if (relevanceKeywords && !skipFilter) {
+      filtered = tools.filter(t => this.isRelevant(t, relevanceKeywords!));
+      console.log(`🎯 Category-relevant: ${filtered.length} tools`);
+    }
+
+    // ── MCP filter ─────────────────────────────────────────────────
+    const mcpTools = filtered.filter(t => t.hasMCPSupport);
     console.log(`🔌 MCP-compatible: ${mcpTools.length} tools`);
     
-    // Analyze each tool with AI
+    // ── AI analysis ────────────────────────────────────────────────
     const results: DiscoveryResult[] = [];
     
     for (const tool of mcpTools.slice(0, limit)) {
@@ -122,14 +177,17 @@ export class ToolDiscovery {
   
   private async discoverFromSource(
     source: DiscoverySource, 
+    searchTerms: string[],
     limit: number,
     maxAgeMonths: number
   ): Promise<DiscoveredTool[]> {
     switch (source) {
       case 'github':
-        return this.github.searchMCPServers(limit, maxAgeMonths);
+        return this.github.searchMCPServers(searchTerms, limit, maxAgeMonths);
       case 'npm':
-        return this.npm.searchMCPServers(limit);
+        return this.npm.searchMCPServers(searchTerms, limit);
+      case 'pypi':
+        return this.pypi.searchMCPServers(searchTerms, limit);
       default:
         console.warn(`Source "${source}" not yet implemented`);
         return [];
@@ -137,16 +195,16 @@ export class ToolDiscovery {
   }
   
   /**
-   * Check if a tool is crypto/DeFi/blockchain/web3 related
+   * Check if a tool is relevant to the given keywords
    */
-  private isCryptoRelated(tool: DiscoveredTool): boolean {
+  private isRelevant(tool: DiscoveredTool, keywords: string[]): boolean {
     const searchText = [
       tool.name,
       tool.description,
       tool.readme?.slice(0, 5000) || ''
     ].join(' ').toLowerCase();
     
-    return CRYPTO_KEYWORDS.some(keyword => searchText.includes(keyword.toLowerCase()));
+    return keywords.some(keyword => searchText.includes(keyword));
   }
   
   /**
@@ -214,6 +272,39 @@ export class ToolDiscovery {
       }
     };
   }
+
+  /**
+   * Analyze a specific PyPI package
+   */
+  async analyzePyPIPackage(name: string): Promise<DiscoveryResult | null> {
+    console.log(`🔍 Fetching ${name} from PyPI...`);
+
+    const tool = await this.pypi.getPackageAsTool(name);
+    if (!tool) {
+      console.error('Package not found on PyPI');
+      return null;
+    }
+
+    console.log(`🤖 Analyzing...`);
+    const decision = await this.ai.analyzeAndDecide(tool);
+
+    console.log(`\n✅ Analysis complete:`);
+    console.log(`  Template: ${decision.template}`);
+    console.log(`  Reasoning: ${decision.reasoning}`);
+
+    const quickImport = this.ai.generateQuickImport(decision);
+    if (quickImport) {
+      console.log(`\n📋 Quick Import JSON:\n${quickImport}`);
+    }
+
+    return {
+      tool,
+      decision,
+      generated: {
+        pluginConfig: decision.config
+      }
+    };
+  }
 }
 
 // Export all types
@@ -221,6 +312,10 @@ export * from './types.js';
 export { AIAnalyzer } from './ai.js';
 export { GitHubSource } from './sources/github.js';
 export { NpmSource } from './sources/npm.js';
+export { PyPISource } from './sources/pypi.js';
+
+// Export categories
+export * from './categories.js';
 
 // Export error classes
 export * from './errors.js';
@@ -230,3 +325,4 @@ export * from './schemas.js';
 
 // Export utilities
 export { withRetry, fetchWithRetry, sleep, calculateBackoff } from './utils/retry.js';
+
