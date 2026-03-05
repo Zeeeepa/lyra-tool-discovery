@@ -161,6 +161,7 @@ export interface TemplateDecision {
 export type DiscoverySource = 
   | 'github'
   | 'npm' 
+  | 'pypi'
   | 'smithery'
   | 'mcp-directory'
   | 'openapi-directory'
@@ -183,6 +184,10 @@ export interface DiscoveredTool {
   hasOpenAPI?: boolean;
   hasMCPSupport?: boolean;
   hasNpmPackage?: boolean;
+  hasPyPIPackage?: boolean;
+  
+  // Category the tool was discovered through
+  categories?: string[];
   
   // Raw data for AI analysis
   readme?: string;
@@ -199,3 +204,4 @@ export interface DiscoveryResult {
     files?: Record<string, string>; // filename -> content
   };
 }
+

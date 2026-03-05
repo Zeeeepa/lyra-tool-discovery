@@ -40,7 +40,7 @@ describe('GitHubSource', () => {
   });
 
   describe('searchMCPServers', () => {
-    it('should search for crypto MCP servers', async () => {
+    it('should search for MCP servers with given search terms', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -50,19 +50,19 @@ describe('GitHubSource', () => {
               id: 123,
               full_name: 'owner/repo',
               name: 'repo',
-              description: 'A crypto MCP server',
+              description: 'A research MCP server',
               html_url: 'https://github.com/owner/repo',
               homepage: 'https://example.com',
               license: { spdx_id: 'MIT' },
               owner: { login: 'owner' },
               stargazers_count: 100,
-              topics: ['mcp', 'crypto'],
+              topics: ['mcp', 'research'],
             },
           ],
         }),
       });
 
-      const tools = await github.searchMCPServers(1);
+      const tools = await github.searchMCPServers(['research', 'arxiv'], 1);
 
       expect(tools).toHaveLength(1);
       expect(tools[0]).toMatchObject({
@@ -71,6 +71,23 @@ describe('GitHubSource', () => {
         source: 'github',
         sourceUrl: 'https://github.com/owner/repo',
       });
+    });
+
+    it('should use default search terms when none provided', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          total_count: 0,
+          items: [],
+        }),
+      });
+
+      const tools = await github.searchMCPServers();
+
+      // Should not throw and return empty
+      expect(tools).toHaveLength(0);
+      // Verify it made at least one search call
+      expect(mockFetch).toHaveBeenCalled();
     });
 
     it('should handle empty results', async () => {
@@ -82,7 +99,7 @@ describe('GitHubSource', () => {
         }),
       });
 
-      const tools = await github.searchMCPServers(10);
+      const tools = await github.searchMCPServers(['database'], 10);
 
       expect(tools).toHaveLength(0);
     });
@@ -110,7 +127,7 @@ describe('GitHubSource', () => {
       });
 
       // Request limit of 5, but same repo returned for all queries
-      const tools = await github.searchMCPServers(5);
+      const tools = await github.searchMCPServers(['test', 'another'], 5);
 
       // Should only have 1 unique tool
       expect(tools.length).toBeLessThanOrEqual(5);
@@ -124,51 +141,58 @@ describe('GitHubSource', () => {
       });
 
       // Should not throw, just return empty or partial results
-      const tools = await github.searchMCPServers(5);
+      const tools = await github.searchMCPServers(['pentest'], 5);
       expect(Array.isArray(tools)).toBe(true);
     });
   });
 
-  describe('analyzeRepo', () => {
-    it('should fetch README and package.json', async () => {
-      // Mock README fetch
+  describe('getRepo', () => {
+    it('should fetch a repo and detect MCP from README', async () => {
+      // First call: repo info
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
-          content: Buffer.from('# Test Repo').toString('base64'),
+          full_name: 'owner/mcp-tool',
+          name: 'mcp-tool',
+          description: 'An MCP tool',
+          html_url: 'https://github.com/owner/mcp-tool',
+          homepage: null,
+          license: { spdx_id: 'MIT' },
+          owner: { login: 'owner' },
+        }),
+      });
+
+      // README fetch
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          content: Buffer.from('# MCP Tool\nUses @modelcontextprotocol').toString('base64'),
           encoding: 'base64',
         }),
       });
 
-      // Mock package.json fetch
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          content: Buffer.from(JSON.stringify({
-            name: 'test-package',
-            dependencies: { '@modelcontextprotocol/sdk': '^1.0.0' },
-          })).toString('base64'),
-          encoding: 'base64',
-        }),
-      });
-
-      const result = await github.analyzeRepo('owner', 'repo');
-
-      expect(result).toBeDefined();
-      expect(result?.readme).toContain('Test Repo');
-      expect(result?.packageJson).toHaveProperty('name', 'test-package');
-    });
-
-    it('should handle missing README', async () => {
+      // package.json fetch
       mockFetch.mockResolvedValueOnce({
         ok: false,
         status: 404,
       });
 
-      const result = await github.analyzeRepo('owner', 'repo');
+      const tool = await github.getRepo('owner', 'mcp-tool');
 
-      // Should return null or partial result
-      expect(result === null || result?.readme === undefined).toBe(true);
+      expect(tool).toBeDefined();
+      expect(tool?.hasMCPSupport).toBe(true);
+      expect(tool?.readme).toContain('MCP Tool');
+    });
+
+    it('should return null for non-existent repo', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+      });
+
+      const tool = await github.getRepo('owner', 'nonexistent');
+      expect(tool).toBeNull();
     });
   });
 });
+

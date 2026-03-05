@@ -1,7 +1,7 @@
 {
   "name": "@nirholas/lyra-tool-discovery",
-  "version": "0.1.0",
-  "description": "AI-powered MCP tool discovery - find, analyze, and generate plugin configs for Model Context Protocol servers",
+  "version": "0.2.0",
+  "description": "AI-powered MCP tool discovery across 19 categories — find, analyze, and generate plugin configs for any MCP server from GitHub, npm, and PyPI",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -10,6 +10,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./categories": {
+      "import": "./dist/categories.js",
+      "types": "./dist/categories.d.ts"
     },
     "./cli": {
       "import": "./dist/cli.js",
@@ -57,15 +61,18 @@
     "ai",
     "tool-discovery",
     "plugin",
-    "crypto",
-    "defi",
-    "blockchain",
-    "web3",
-    "ethereum",
+    "code-analysis",
+    "database",
+    "research",
+    "pentest",
+    "automation",
+    "pypi",
+    "github",
+    "npm",
     "openai",
     "anthropic",
     "claude",
-    "gpt",
+    "agent",
     "speraxos",
     "plugin-delivery"
   ],

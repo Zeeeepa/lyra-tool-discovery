@@ -37,24 +37,24 @@ interface NpmPackage {
 
 export class NpmSource {
   /**
-   * Search npm for MCP servers (crypto/DeFi/blockchain/web3 focused)
+   * Search npm for MCP servers matching the given search terms.
+   * When no terms are provided, performs a general MCP server search.
    */
-  async searchMCPServers(limit = 10): Promise<DiscoveredTool[]> {
-    // Crypto/DeFi/blockchain/web3 focused MCP package queries
-    const cryptoTerms = ['crypto', 'defi', 'blockchain', 'web3', 'ethereum', 'solana', 'bitcoin', 'wallet', 'token', 'nft', 'dex', 'swap', 'staking'];
-    
-    const queries = [
-      // MCP packages with crypto focus
-      ...cryptoTerms.map(term => `mcp ${term}`),
-      ...cryptoTerms.map(term => `mcp-server ${term}`),
-      // Direct crypto MCP searches
-      'mcp crypto',
-      'mcp defi',
-      'mcp blockchain',
-      'mcp web3',
-      '@modelcontextprotocol crypto',
-      '@modelcontextprotocol defi'
-    ];
+  async searchMCPServers(
+    searchTerms: string[] = ['mcp-server'],
+    limit = 10,
+  ): Promise<DiscoveredTool[]> {
+    const queries: string[] = [];
+
+    for (const term of searchTerms) {
+      queries.push(`mcp ${term}`);
+      queries.push(`mcp-server ${term}`);
+    }
+
+    // Also add direct @modelcontextprotocol searches for the first few terms
+    for (const term of searchTerms.slice(0, 3)) {
+      queries.push(`@modelcontextprotocol ${term}`);
+    }
     
     const tools: DiscoveredTool[] = [];
     const seen = new Set<string>();
@@ -125,10 +125,6 @@ export class NpmSource {
         
         // If it has a bin, it's likely a CLI tool (STDIO MCP)
         if (fullPkg.bin) {
-          const binName = typeof fullPkg.bin === 'string' 
-            ? fullPkg.name 
-            : Object.keys(fullPkg.bin)[0];
-          
           tool.mcpConfig = {
             type: 'stdio',
             command: 'npx',
@@ -210,3 +206,4 @@ export class NpmSource {
     return tool;
   }
 }
+
