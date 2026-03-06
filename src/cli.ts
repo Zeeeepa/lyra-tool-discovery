@@ -16,7 +16,7 @@ program
   .command('discover')
   .description('Search for MCP tools across sources for a given category')
   .option('-s, --sources <sources>', 'Comma-separated sources: github,npm', 'github,npm')
-  .option('-l, --limit <number>', 'Max tools to discover', '5')
+  .option('-l, --limit <number>', 'Max tools to analyze/display (fetching is always exhaustive)', '20')
   .option('-a, --max-age <months>', 'Max age in months (default: 12)', '12')
   .option('-c, --category <category>', 'Category to discover (run "categories" to see all)', 'trading')
   .option('-d, --dry-run', 'List discovered tools without AI analysis')
@@ -166,4 +166,3 @@ Standard Templates:
   });
 
 program.parse();
-

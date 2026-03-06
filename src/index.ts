@@ -16,6 +16,7 @@ import {
 
 export interface DiscoveryOptions {
   sources?: DiscoverySource[];
+  /** How many results to analyze/display (does NOT limit fetching) */
   limit?: number;
   dryRun?: boolean;
   outputDir?: string;
@@ -38,13 +39,13 @@ export class ToolDiscovery {
   /**
    * Discover MCP tools from configured sources for the given category.
    *
-   * When `category` is omitted the behaviour is identical to the original
-   * crypto-only mode (backward compatible).
+   * Sources are queried **exhaustively** — every search term, every page.
+   * `limit` only controls how many results get analyzed/displayed at the end.
    */
   async discover(options: DiscoveryOptions = {}): Promise<DiscoveryResult[]> {
     const {
       sources = ['github', 'npm'],
-      limit = 10,
+      limit = 20,
       dryRun = false,
       maxAgeMonths = 12,
       category = DEFAULT_CATEGORY,
@@ -58,11 +59,11 @@ export class ToolDiscovery {
     
     const tools: DiscoveredTool[] = [];
     
-    // Collect from each source
+    // Collect from each source — exhaustively, NO limit passed.
     for (const source of sources) {
       try {
         const discovered = await this.discoverFromSource(
-          source, limit, maxAgeMonths, categoryConfig.searchTerms,
+          source, maxAgeMonths, categoryConfig.searchTerms,
         );
         console.log(`  Found ${discovered.length} from ${source}`);
         tools.push(...discovered);
@@ -92,7 +93,7 @@ export class ToolDiscovery {
     const mcpTools = relevantTools.filter(t => t.hasMCPSupport);
     console.log(`🔌 MCP-compatible: ${mcpTools.length} tools`);
     
-    // Analyze each tool with AI
+    // Analyze each tool with AI — only the top `limit` results
     const results: DiscoveryResult[] = [];
     
     for (const tool of mcpTools.slice(0, limit)) {
@@ -132,17 +133,19 @@ export class ToolDiscovery {
     return results;
   }
   
+  /**
+   * Fetch tools from a single source — exhaustively. No limit.
+   */
   private async discoverFromSource(
     source: DiscoverySource, 
-    limit: number,
     maxAgeMonths: number,
     searchTerms: string[],
   ): Promise<DiscoveredTool[]> {
     switch (source) {
       case 'github':
-        return this.github.searchMCPServers(searchTerms, limit, maxAgeMonths);
+        return this.github.searchMCPServers(searchTerms, undefined, maxAgeMonths);
       case 'npm':
-        return this.npm.searchMCPServers(searchTerms, limit);
+        return this.npm.searchMCPServers(searchTerms, undefined);
       default:
         console.warn(`Source "${source}" not yet implemented`);
         return [];

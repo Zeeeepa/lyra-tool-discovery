@@ -3,7 +3,21 @@ import type { DiscoveredTool } from '../types.js';
 const NPM_REGISTRY = 'https://registry.npmjs.org';
 const NPM_SEARCH = 'https://registry.npmjs.org/-/v1/search';
 
+/**
+ * npm search API supports `size` up to 250 and `from` for pagination.
+ * We paginate through ALL results for every query.
+ */
+const NPM_PAGE_SIZE = 250;
+
+/** Delay between npm API requests to be polite and avoid 429s */
+const NPM_DELAY_MS = 1_500;
+
+/** Backoff when rate-limited */
+const NPM_RATE_LIMIT_BACKOFF_MS = 10_000;
+const NPM_MAX_RETRIES = 3;
+
 interface NpmSearchResult {
+  total: number;
   objects: Array<{
     package: {
       name: string;
@@ -36,15 +50,22 @@ interface NpmPackage {
 }
 
 export class NpmSource {
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   /**
-   * Search npm for MCP servers.
+   * Search npm for MCP servers — **exhaustively**.
+   *
+   * Every search term is queried. Every page is fetched.
+   * Results are deduplicated by package name.
+   * There is NO cap — the caller receives everything npm returns.
    *
    * @param searchTerms  Category-specific search terms.
-   *                     When omitted the method falls back to legacy crypto terms.
-   * @param limit        Maximum number of tools to return.
+   *                     Falls back to legacy crypto terms when omitted.
+   * @param _limit       Ignored — kept for backward compat signature.
    */
-  async searchMCPServers(searchTerms?: string[], limit = 10): Promise<DiscoveredTool[]> {
-    // Fall back to legacy crypto terms when no search terms are provided.
+  async searchMCPServers(searchTerms?: string[], _limit?: number): Promise<DiscoveredTool[]> {
     const terms = searchTerms && searchTerms.length > 0
       ? searchTerms
       : [
@@ -57,17 +78,20 @@ export class NpmSource {
     const queries = [
       // MCP packages with category focus
       ...terms.map(term => `mcp ${term.split(' ')[0]}`),
-      ...terms.slice(0, 6).map(term => `mcp-server ${term.split(' ')[0]}`),
+      ...terms.map(term => `mcp-server ${term.split(' ')[0]}`),
+      ...terms.map(term => `modelcontextprotocol ${term.split(' ')[0]}`),
     ];
     
     const tools: DiscoveredTool[] = [];
     const seen = new Set<string>();
-    
-    for (const query of queries) {
-      if (tools.length >= limit) break;
-      
+
+    console.log(`  [npm] Running ${queries.length} queries (exhaustive, all pages)…`);
+
+    // Run EVERY query, fetch ALL pages — no early break.
+    for (let qi = 0; qi < queries.length; qi++) {
+      const query = queries[qi];
       try {
-        const results = await this.search(query, limit - tools.length);
+        const results = await this.searchExhaustive(query, qi, queries.length);
         for (const tool of results) {
           if (!seen.has(tool.id)) {
             seen.add(tool.id);
@@ -75,75 +99,124 @@ export class NpmSource {
           }
         }
       } catch (error) {
-        console.error(`NPM search failed for "${query}":`, error);
+        const msg = error instanceof Error ? error.message : String(error);
+        console.error(`  [npm] Query ${qi + 1}/${queries.length} failed: ${msg}`);
+      }
+
+      // Throttle between queries to avoid 429
+      if (qi < queries.length - 1) {
+        await this.sleep(NPM_DELAY_MS);
       }
     }
-    
-    return tools.slice(0, limit);
+
+    console.log(`  [npm] ${queries.length} queries → ${tools.length} unique packages`);
+    return tools;
   }
-  
-  private async search(query: string, size = 10): Promise<DiscoveredTool[]> {
-    const url = `${NPM_SEARCH}?text=${encodeURIComponent(query)}&size=${size}`;
-    
-    const response = await fetch(url);
-    
-    if (!response.ok) {
-      throw new Error(`NPM search error: ${response.status}`);
-    }
-    
-    const data = await response.json() as NpmSearchResult;
-    
-    return Promise.all(data.objects.map(async (obj) => {
-      const pkg = obj.package;
-      
-      // Fetch full package info for more details
-      const fullPkg = await this.getPackage(pkg.name).catch(() => null);
-      
-      const tool: DiscoveredTool = {
-        id: `npm:${pkg.name}`,
-        name: pkg.name,
-        description: pkg.description || '',
-        source: 'npm',
-        sourceUrl: pkg.links.npm,
-        author: typeof pkg.author === 'string' ? pkg.author : pkg.author?.name,
-        homepage: pkg.links.homepage,
-        repository: pkg.links.repository,
-        hasNpmPackage: true,
-        hasMCPSupport: pkg.keywords?.includes('mcp') || 
-                       pkg.name.includes('mcp') ||
-                       pkg.description?.toLowerCase().includes('mcp')
-      };
-      
-      if (fullPkg) {
-        tool.license = fullPkg.license;
-        tool.packageJson = fullPkg as unknown as Record<string, unknown>;
-        
-        if (fullPkg.readme) {
-          tool.readme = fullPkg.readme;
+
+  /**
+   * Fetch ALL pages for a single npm search query.
+   * Lightweight — does NOT fetch full package info during search.
+   * Includes retry logic for rate limits (429).
+   */
+  private async searchExhaustive(
+    query: string,
+    queryIndex: number,
+    totalQueries: number,
+  ): Promise<DiscoveredTool[]> {
+    const allTools: DiscoveredTool[] = [];
+    let from = 0;
+    let retries = 0;
+
+    while (true) {
+      const url = `${NPM_SEARCH}?text=${encodeURIComponent(query)}&size=${NPM_PAGE_SIZE}&from=${from}`;
+
+      const response = await fetch(url);
+
+      // ── Rate-limit handling ──────────────────────────────────
+      if (response.status === 429) {
+        retries++;
+        if (retries > NPM_MAX_RETRIES) {
+          console.error(`  [npm] Query ${queryIndex + 1}/${totalQueries}: rate-limit retries exhausted`);
+          break;
         }
-        
-        // Check for MCP SDK dependency
-        if (fullPkg.dependencies?.['@modelcontextprotocol/sdk']) {
-          tool.hasMCPSupport = true;
-        }
-        
-        // If it has a bin, it's likely a CLI tool (STDIO MCP)
-        if (fullPkg.bin) {
-          const binName = typeof fullPkg.bin === 'string' 
-            ? fullPkg.name 
-            : Object.keys(fullPkg.bin)[0];
-          
-          tool.mcpConfig = {
-            type: 'stdio',
-            command: 'npx',
-            args: ['-y', fullPkg.name],
-            env: {}
-          };
-        }
+        const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
+        const waitMs = retryAfter > 0 ? retryAfter * 1000 : NPM_RATE_LIMIT_BACKOFF_MS;
+        console.error(`  [npm] Rate limited (429), waiting ${Math.round(waitMs / 1000)}s (retry ${retries}/${NPM_MAX_RETRIES})…`);
+        await this.sleep(waitMs);
+        continue; // Retry the same page
       }
-      
-      return tool;
-    }));
+
+      if (!response.ok) {
+        throw new Error(`npm search error: ${response.status}`);
+      }
+
+      // Reset retry counter on successful response
+      retries = 0;
+
+      const data = await response.json() as NpmSearchResult;
+
+      for (const obj of data.objects) {
+        const pkg = obj.package;
+        allTools.push({
+          id: `npm:${pkg.name}`,
+          name: pkg.name,
+          description: pkg.description || '',
+          source: 'npm',
+          sourceUrl: pkg.links.npm,
+          author: typeof pkg.author === 'string' ? pkg.author : pkg.author?.name,
+          homepage: pkg.links.homepage,
+          repository: pkg.links.repository,
+          hasNpmPackage: true,
+          hasMCPSupport: pkg.keywords?.includes('mcp') || 
+                         pkg.name.includes('mcp') ||
+                         pkg.description?.toLowerCase().includes('mcp') || false,
+        });
+      }
+
+      // Stop if we've exhausted all results
+      if (data.objects.length < NPM_PAGE_SIZE || allTools.length >= data.total) {
+        break;
+      }
+      from += NPM_PAGE_SIZE;
+
+      // Throttle between pages
+      await this.sleep(NPM_DELAY_MS);
+    }
+
+    return allTools;
+  }
+
+  /**
+   * Enrich a tool with full npm package metadata (bin, deps, readme).
+   * Expensive — 1 API call per package. Call AFTER filtering.
+   */
+  async enrichTool(tool: DiscoveredTool): Promise<DiscoveredTool> {
+    const fullPkg = await this.getPackage(tool.name).catch(() => null);
+    if (!fullPkg) return tool;
+
+    tool.license = fullPkg.license;
+    tool.packageJson = fullPkg as unknown as Record<string, unknown>;
+
+    if (fullPkg.readme) {
+      tool.readme = fullPkg.readme;
+    }
+
+    // Check for MCP SDK dependency
+    if (fullPkg.dependencies?.['@modelcontextprotocol/sdk']) {
+      tool.hasMCPSupport = true;
+    }
+
+    // If it has a bin, it's likely a CLI tool (STDIO MCP)
+    if (fullPkg.bin) {
+      tool.mcpConfig = {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', fullPkg.name],
+        env: {}
+      };
+    }
+
+    return tool;
   }
   
   private async getPackage(name: string): Promise<NpmPackage | null> {
@@ -170,7 +243,7 @@ export class NpmSource {
   }
   
   /**
-   * Get a specific package as a discovered tool
+   * Get a specific package as a discovered tool (with enrichment).
    */
   async getPackageAsTool(name: string): Promise<DiscoveredTool | null> {
     const pkg = await this.getPackage(name);
@@ -214,3 +287,4 @@ export class NpmSource {
     return tool;
   }
 }
+

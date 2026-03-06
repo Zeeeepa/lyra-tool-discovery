@@ -183,6 +183,9 @@ export interface DiscoveredTool {
   // Category that matched this tool (set during discovery)
   category?: string;
 
+  // Popularity
+  stars?: number;
+
   // Type hints
   hasOpenAPI?: boolean;
   hasMCPSupport?: boolean;
