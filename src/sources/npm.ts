@@ -37,23 +37,27 @@ interface NpmPackage {
 
 export class NpmSource {
   /**
-   * Search npm for MCP servers (crypto/DeFi/blockchain/web3 focused)
+   * Search npm for MCP servers.
+   *
+   * @param searchTerms  Category-specific search terms.
+   *                     When omitted the method falls back to legacy crypto terms.
+   * @param limit        Maximum number of tools to return.
    */
-  async searchMCPServers(limit = 10): Promise<DiscoveredTool[]> {
-    // Crypto/DeFi/blockchain/web3 focused MCP package queries
-    const cryptoTerms = ['crypto', 'defi', 'blockchain', 'web3', 'ethereum', 'solana', 'bitcoin', 'wallet', 'token', 'nft', 'dex', 'swap', 'staking'];
-    
+  async searchMCPServers(searchTerms?: string[], limit = 10): Promise<DiscoveredTool[]> {
+    // Fall back to legacy crypto terms when no search terms are provided.
+    const terms = searchTerms && searchTerms.length > 0
+      ? searchTerms
+      : [
+          'crypto mcp', 'defi mcp server', 'blockchain mcp', 'web3 mcp',
+          'ethereum mcp', 'solana mcp', 'bitcoin mcp', 'wallet mcp',
+          'token mcp', 'nft mcp server', 'dex mcp', 'swap mcp',
+          'staking mcp', 'trading mcp server',
+        ];
+
     const queries = [
-      // MCP packages with crypto focus
-      ...cryptoTerms.map(term => `mcp ${term}`),
-      ...cryptoTerms.map(term => `mcp-server ${term}`),
-      // Direct crypto MCP searches
-      'mcp crypto',
-      'mcp defi',
-      'mcp blockchain',
-      'mcp web3',
-      '@modelcontextprotocol crypto',
-      '@modelcontextprotocol defi'
+      // MCP packages with category focus
+      ...terms.map(term => `mcp ${term.split(' ')[0]}`),
+      ...terms.slice(0, 6).map(term => `mcp-server ${term.split(' ')[0]}`),
     ];
     
     const tools: DiscoveredTool[] = [];

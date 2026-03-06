@@ -8,6 +8,11 @@ import type {
   CustomPlugin,
   PluginIndexEntry
 } from './types.js';
+import {
+  getCategoryConfig,
+  isRelevantToCategory,
+  DEFAULT_CATEGORY,
+} from './categories.js';
 
 export interface DiscoveryOptions {
   sources?: DiscoverySource[];
@@ -15,18 +20,9 @@ export interface DiscoveryOptions {
   dryRun?: boolean;
   outputDir?: string;
   maxAgeMonths?: number;
+  /** Category to discover for (default: 'trading' — same as legacy crypto mode) */
+  category?: string;
 }
-
-// Crypto/DeFi/blockchain/web3 keywords for filtering
-const CRYPTO_KEYWORDS = [
-  'crypto', 'cryptocurrency', 'defi', 'blockchain', 'web3',
-  'ethereum', 'eth', 'solana', 'sol', 'bitcoin', 'btc',
-  'wallet', 'token', 'nft', 'dex', 'swap', 'staking',
-  'yield', 'bridge', 'chain', 'smart contract', 'erc20',
-  'erc721', 'uniswap', 'aave', 'compound', 'lending',
-  'liquidity', 'vault', 'protocol', 'onchain', 'on-chain',
-  'web3.js', 'ethers', 'viem', 'wagmi', 'rainbowkit'
-];
 
 export class ToolDiscovery {
   private github: GitHubSource;
@@ -40,17 +36,24 @@ export class ToolDiscovery {
   }
   
   /**
-   * Discover crypto/DeFi/blockchain/web3 tools from configured sources
+   * Discover MCP tools from configured sources for the given category.
+   *
+   * When `category` is omitted the behaviour is identical to the original
+   * crypto-only mode (backward compatible).
    */
   async discover(options: DiscoveryOptions = {}): Promise<DiscoveryResult[]> {
     const {
       sources = ['github', 'npm'],
       limit = 10,
       dryRun = false,
-      maxAgeMonths = 12
+      maxAgeMonths = 12,
+      category = DEFAULT_CATEGORY,
     } = options;
+
+    // Resolve category config (throws on unknown category)
+    const categoryConfig = getCategoryConfig(category);
     
-    console.log(`🔍 Discovering crypto/DeFi/web3 tools from: ${sources.join(', ')}`);
+    console.log(`🔍 Discovering ${categoryConfig.displayName} tools from: ${sources.join(', ')}`);
     console.log(`📅 Max age: ${maxAgeMonths} months`);
     
     const tools: DiscoveredTool[] = [];
@@ -58,7 +61,9 @@ export class ToolDiscovery {
     // Collect from each source
     for (const source of sources) {
       try {
-        const discovered = await this.discoverFromSource(source, limit, maxAgeMonths);
+        const discovered = await this.discoverFromSource(
+          source, limit, maxAgeMonths, categoryConfig.searchTerms,
+        );
         console.log(`  Found ${discovered.length} from ${source}`);
         tools.push(...discovered);
       } catch (error) {
@@ -72,12 +77,19 @@ export class ToolDiscovery {
       return [];
     }
     
-    // Filter to only crypto-related tools
-    const cryptoTools = tools.filter(t => this.isCryptoRelated(t));
-    console.log(`🪙 Crypto-related: ${cryptoTools.length} tools`);
+    // Filter to only category-relevant tools
+    const relevantTools = tools.filter(t =>
+      isRelevantToCategory(t, categoryConfig.relevanceKeywords),
+    );
+    console.log(`🏷️  ${categoryConfig.displayName}-related: ${relevantTools.length} tools`);
+
+    // Tag each tool with its category
+    for (const tool of relevantTools) {
+      tool.category = category;
+    }
     
     // Filter to only tools with MCP support
-    const mcpTools = cryptoTools.filter(t => t.hasMCPSupport);
+    const mcpTools = relevantTools.filter(t => t.hasMCPSupport);
     console.log(`🔌 MCP-compatible: ${mcpTools.length} tools`);
     
     // Analyze each tool with AI
@@ -123,30 +135,18 @@ export class ToolDiscovery {
   private async discoverFromSource(
     source: DiscoverySource, 
     limit: number,
-    maxAgeMonths: number
+    maxAgeMonths: number,
+    searchTerms: string[],
   ): Promise<DiscoveredTool[]> {
     switch (source) {
       case 'github':
-        return this.github.searchMCPServers(limit, maxAgeMonths);
+        return this.github.searchMCPServers(searchTerms, limit, maxAgeMonths);
       case 'npm':
-        return this.npm.searchMCPServers(limit);
+        return this.npm.searchMCPServers(searchTerms, limit);
       default:
         console.warn(`Source "${source}" not yet implemented`);
         return [];
     }
-  }
-  
-  /**
-   * Check if a tool is crypto/DeFi/blockchain/web3 related
-   */
-  private isCryptoRelated(tool: DiscoveredTool): boolean {
-    const searchText = [
-      tool.name,
-      tool.description,
-      tool.readme?.slice(0, 5000) || ''
-    ].join(' ').toLowerCase();
-    
-    return CRYPTO_KEYWORDS.some(keyword => searchText.includes(keyword.toLowerCase()));
   }
   
   /**
@@ -222,6 +222,17 @@ export { AIAnalyzer } from './ai.js';
 export { GitHubSource } from './sources/github.js';
 export { NpmSource } from './sources/npm.js';
 
+// Export category system
+export {
+  getCategoryConfig,
+  listCategories,
+  isRelevantToCategory,
+  isValidCategory,
+  CATEGORIES,
+  DEFAULT_CATEGORY,
+} from './categories.js';
+export type { CategoryConfig } from './categories.js';
+
 // Export error classes
 export * from './errors.js';
 
@@ -230,3 +241,4 @@ export * from './schemas.js';
 
 // Export utilities
 export { withRetry, fetchWithRetry, sleep, calculateBackoff } from './utils/retry.js';
+

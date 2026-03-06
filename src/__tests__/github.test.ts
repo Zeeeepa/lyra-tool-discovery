@@ -40,7 +40,7 @@ describe('GitHubSource', () => {
   });
 
   describe('searchMCPServers', () => {
-    it('should search for crypto MCP servers', async () => {
+    it('should search for MCP servers with default (trading) terms', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -62,7 +62,8 @@ describe('GitHubSource', () => {
         }),
       });
 
-      const tools = await github.searchMCPServers(1);
+      // No searchTerms → defaults to crypto/trading
+      const tools = await github.searchMCPServers(undefined, 1);
 
       expect(tools).toHaveLength(1);
       expect(tools[0]).toMatchObject({
@@ -71,6 +72,35 @@ describe('GitHubSource', () => {
         source: 'github',
         sourceUrl: 'https://github.com/owner/repo',
       });
+    });
+
+    it('should search with custom category search terms', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          total_count: 1,
+          items: [
+            {
+              id: 456,
+              full_name: 'owner/db-mcp',
+              name: 'db-mcp',
+              description: 'A database MCP server',
+              html_url: 'https://github.com/owner/db-mcp',
+              homepage: null,
+              license: null,
+              owner: { login: 'owner' },
+              stargazers_count: 50,
+              topics: ['mcp', 'database'],
+            },
+          ],
+        }),
+      });
+
+      const dbTerms = ['database mcp server', 'sql mcp', 'postgres mcp'];
+      const tools = await github.searchMCPServers(dbTerms, 1);
+
+      expect(tools).toHaveLength(1);
+      expect(tools[0].name).toBe('db-mcp');
     });
 
     it('should handle empty results', async () => {
@@ -82,7 +112,7 @@ describe('GitHubSource', () => {
         }),
       });
 
-      const tools = await github.searchMCPServers(10);
+      const tools = await github.searchMCPServers(undefined, 10);
 
       expect(tools).toHaveLength(0);
     });
@@ -110,7 +140,7 @@ describe('GitHubSource', () => {
       });
 
       // Request limit of 5, but same repo returned for all queries
-      const tools = await github.searchMCPServers(5);
+      const tools = await github.searchMCPServers(undefined, 5);
 
       // Should only have 1 unique tool
       expect(tools.length).toBeLessThanOrEqual(5);
@@ -124,18 +154,32 @@ describe('GitHubSource', () => {
       });
 
       // Should not throw, just return empty or partial results
-      const tools = await github.searchMCPServers(5);
+      const tools = await github.searchMCPServers(undefined, 5);
       expect(Array.isArray(tools)).toBe(true);
     });
   });
 
-  describe('analyzeRepo', () => {
-    it('should fetch README and package.json', async () => {
+  describe('getRepo', () => {
+    it('should fetch repo as a discovered tool', async () => {
+      // Mock repo fetch
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          full_name: 'owner/repo',
+          name: 'repo',
+          description: 'A test repo',
+          html_url: 'https://github.com/owner/repo',
+          homepage: 'https://example.com',
+          license: { spdx_id: 'MIT' },
+          owner: { login: 'owner' },
+        }),
+      });
+
       // Mock README fetch
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
-          content: Buffer.from('# Test Repo').toString('base64'),
+          content: Buffer.from('# Test Repo\nMCP server').toString('base64'),
           encoding: 'base64',
         }),
       });
@@ -152,23 +196,23 @@ describe('GitHubSource', () => {
         }),
       });
 
-      const result = await github.analyzeRepo('owner', 'repo');
+      const result = await github.getRepo('owner', 'repo');
 
       expect(result).toBeDefined();
       expect(result?.readme).toContain('Test Repo');
       expect(result?.packageJson).toHaveProperty('name', 'test-package');
     });
 
-    it('should handle missing README', async () => {
+    it('should return null for non-existent repo', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: false,
         status: 404,
       });
 
-      const result = await github.analyzeRepo('owner', 'repo');
+      const result = await github.getRepo('owner', 'nonexistent');
 
-      // Should return null or partial result
-      expect(result === null || result?.readme === undefined).toBe(true);
+      expect(result).toBeNull();
     });
   });
 });
+

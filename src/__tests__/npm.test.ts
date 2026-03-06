@@ -18,7 +18,7 @@ describe('NpmSource', () => {
   });
 
   describe('searchMCPServers', () => {
-    it('should search for crypto MCP packages', async () => {
+    it('should search for MCP packages with default (trading) terms', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -42,7 +42,8 @@ describe('NpmSource', () => {
         }),
       });
 
-      const tools = await npm.searchMCPServers(1);
+      // No searchTerms → defaults to crypto/trading
+      const tools = await npm.searchMCPServers(undefined, 1);
 
       expect(tools).toHaveLength(1);
       expect(tools[0]).toMatchObject({
@@ -50,6 +51,35 @@ describe('NpmSource', () => {
         name: '@crypto/mcp-server',
         source: 'npm',
       });
+    });
+
+    it('should search with custom category search terms', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          objects: [
+            {
+              package: {
+                name: 'mcp-postgres',
+                version: '1.0.0',
+                description: 'PostgreSQL MCP server',
+                keywords: ['mcp', 'postgres'],
+                author: { name: 'author' },
+                links: {
+                  npm: 'https://www.npmjs.com/package/mcp-postgres',
+                },
+                publisher: { username: 'user' },
+              },
+            },
+          ],
+        }),
+      });
+
+      const dbTerms = ['database mcp server', 'sql mcp', 'postgres mcp'];
+      const tools = await npm.searchMCPServers(dbTerms, 1);
+
+      expect(tools).toHaveLength(1);
+      expect(tools[0].name).toBe('mcp-postgres');
     });
 
     it('should handle empty results', async () => {
@@ -60,7 +90,7 @@ describe('NpmSource', () => {
         }),
       });
 
-      const tools = await npm.searchMCPServers(10);
+      const tools = await npm.searchMCPServers(undefined, 10);
 
       expect(tools).toHaveLength(0);
     });
@@ -91,14 +121,13 @@ describe('NpmSource', () => {
         ok: true,
         json: async () => ({
           name: 'my-mcp-tool',
-          version: '1.0.0',
           description: 'Tool with MCP',
-          dependencies: {
-            '@modelcontextprotocol/sdk': '^1.0.0',
-          },
           'dist-tags': { latest: '1.0.0' },
           versions: {
             '1.0.0': {
+              name: 'my-mcp-tool',
+              version: '1.0.0',
+              description: 'Tool with MCP',
               dependencies: {
                 '@modelcontextprotocol/sdk': '^1.0.0',
               },
@@ -107,7 +136,7 @@ describe('NpmSource', () => {
         }),
       });
 
-      const tools = await npm.searchMCPServers(1);
+      const tools = await npm.searchMCPServers(undefined, 1);
 
       expect(tools).toHaveLength(1);
       expect(tools[0].hasMCPSupport).toBe(true);
@@ -132,23 +161,25 @@ describe('NpmSource', () => {
         }),
       });
 
-      // Full package info with bin
+      // Full package info with bin — note the versioned structure
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           name: 'mcp-cli-tool',
-          version: '1.0.0',
-          bin: { 'mcp-cli': './bin/cli.js' },
+          description: 'CLI tool',
           'dist-tags': { latest: '1.0.0' },
           versions: {
             '1.0.0': {
+              name: 'mcp-cli-tool',
+              version: '1.0.0',
+              description: 'CLI tool',
               bin: { 'mcp-cli': './bin/cli.js' },
             },
           },
         }),
       });
 
-      const tools = await npm.searchMCPServers(1);
+      const tools = await npm.searchMCPServers(undefined, 1);
 
       expect(tools).toHaveLength(1);
       expect(tools[0].mcpConfig).toMatchObject({
@@ -165,22 +196,22 @@ describe('NpmSource', () => {
         ok: true,
         json: async () => ({
           name: 'test-package',
-          version: '2.0.0',
           description: 'Test package',
-          license: 'MIT',
-          author: { name: 'Test Author' },
-          homepage: 'https://test.com',
-          repository: { url: 'https://github.com/test/test' },
-          keywords: ['mcp', 'test'],
-          readme: '# Test Package',
           'dist-tags': { latest: '2.0.0' },
           versions: {
             '2.0.0': {
               name: 'test-package',
               version: '2.0.0',
+              description: 'Test package',
+              license: 'MIT',
+              author: { name: 'Test Author' },
+              homepage: 'https://test.com',
+              repository: { url: 'https://github.com/test/test' },
+              keywords: ['mcp', 'test'],
               dependencies: {},
             },
           },
+          readme: '# Test Package',
         }),
       });
 
@@ -190,9 +221,9 @@ describe('NpmSource', () => {
         id: 'npm:test-package',
         name: 'test-package',
         source: 'npm',
-        license: 'MIT',
-        author: 'Test Author',
       });
+      // readme is set from top-level data
+      expect(tool?.readme).toContain('Test Package');
     });
 
     it('should return null for non-existent package', async () => {
@@ -207,3 +238,4 @@ describe('NpmSource', () => {
     });
   });
 });
+
