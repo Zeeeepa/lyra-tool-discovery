@@ -9,9 +9,17 @@ const GITHUB_API = 'https://api.github.com';
 const PER_PAGE = 100;
 const MAX_PAGES_PER_QUERY = 10; // GitHub hard-limit: 1 000 results
 
-/** Delay between search API requests to stay within rate limits */
-const SEARCH_DELAY_MS = 2_200; // GitHub allows ~30 search requests/min (2s between)
-const RATE_LIMIT_BACKOFF_MS = 60_000; // Wait 60s when rate-limited
+/**
+ * Rate-limit strategy: we read x-ratelimit-remaining from every response
+ * and only sleep when we're running low. This is much faster than a fixed
+ * 2-second delay between every request.
+ *
+ * Authenticated users: 30 search requests / minute
+ * Unauthenticated:     10 search requests / minute
+ */
+const RATE_LIMIT_CUSHION = 2;          // Start sleeping when remaining ≤ this
+const MIN_DELAY_MS = 200;              // Polite minimum gap between any two requests
+const RATE_LIMIT_BACKOFF_MS = 62_000;  // Wait when actually rate-limited (just over 1 min)
 const MAX_RATE_LIMIT_RETRIES = 3;
 
 interface GitHubSearchResult {
@@ -58,13 +66,34 @@ export class GitHubSource {
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
+
+  /**
+   * Determine how long to wait based on the rate-limit headers from the
+   * most recent response.  Returns 0 when there's plenty of budget left.
+   */
+  private rateLimitDelay(headers: { get(name: string): string | null }): number {
+    const remaining = parseInt(headers.get('x-ratelimit-remaining') || '999', 10);
+
+    if (remaining > RATE_LIMIT_CUSHION) {
+      return MIN_DELAY_MS;           // Plenty of budget → just a polite gap
+    }
+
+    // We're nearly exhausted — sleep until the reset window
+    const resetEpoch = parseInt(headers.get('x-ratelimit-reset') || '0', 10);
+    if (resetEpoch > 0) {
+      const waitMs = Math.max(0, resetEpoch * 1000 - Date.now() + 1000);
+      return waitMs;
+    }
+
+    return RATE_LIMIT_BACKOFF_MS;    // Fallback: wait ~1 minute
+  }
   
   /**
    * Search GitHub for MCP servers — **exhaustively**.
    *
-   * Every search term is queried. Every available page is fetched (up to
-   * GitHub's 1 000-result-per-query cap). Results are deduplicated by repo
-   * full_name. There is NO internal result cap — the caller receives
+   * Every search term is queried.  Every available page is fetched (up to
+   * GitHub's 1 000-result-per-query cap).  Results are deduplicated by repo
+   * full_name.  There is NO internal result cap — the caller receives
    * everything GitHub returns.
    *
    * @param searchTerms  Category-specific search terms.
@@ -89,9 +118,7 @@ export class GitHubSource {
         ];
 
     const queries = [
-      // MCP servers with category focus
       ...terms.map(term => `${term} in:name,description,readme ${dateFilter}`),
-      // Also search with modelcontextprotocol prefix for each base keyword
       ...terms.map(term => `modelcontextprotocol ${term.split(' ')[0]} in:name,description ${dateFilter}`),
     ];
     
@@ -100,7 +127,6 @@ export class GitHubSource {
 
     console.log(`  [GitHub] Running ${queries.length} queries (exhaustive, all pages)…`);
 
-    // Run EVERY query, fetch ALL pages — no early break.
     for (let qi = 0; qi < queries.length; qi++) {
       const query = queries[qi];
       try {
@@ -112,7 +138,6 @@ export class GitHubSource {
           }
         }
       } catch (error) {
-        // Log but continue — don't abort remaining queries
         const msg = error instanceof Error ? error.message : String(error);
         console.error(`  [GitHub] Query ${qi + 1}/${queries.length} failed: ${msg}`);
       }
@@ -157,11 +182,12 @@ export class GitHubSource {
    * Fetch ALL pages for a single GitHub search query (up to 1 000 results).
    *
    * Does NOT fetch README/package.json — that would be thousands of extra
-   * API calls. Use enrichTool() selectively after filtering.
+   * API calls.  Use enrichTool() selectively after filtering.
    *
-   * Respects rate limits:
-   *  - Pauses SEARCH_DELAY_MS between requests
-   *  - Backs off RATE_LIMIT_BACKOFF_MS on 403/429 and retries
+   * Rate-limit strategy:
+   *  - Reads x-ratelimit-remaining from every response
+   *  - Only sleeps significantly when budget is nearly exhausted
+   *  - Falls back to 60 s backoff + retry on 403/429
    */
   private async searchReposExhaustive(
     query: string,
@@ -173,22 +199,37 @@ export class GitHubSource {
     let rateLimitRetries = 0;
 
     while (page <= MAX_PAGES_PER_QUERY) {
-      const url = `${GITHUB_API}/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=${PER_PAGE}&page=${page}`;
+      const url =
+        `${GITHUB_API}/search/repositories` +
+        `?q=${encodeURIComponent(query)}` +
+        `&sort=stars&order=desc` +
+        `&per_page=${PER_PAGE}&page=${page}`;
 
       const response = await fetch(url, { headers: this.headers });
 
-      // ── Rate-limit handling ──────────────────────────────────
+      // ── Rate-limit / error handling ──────────────────────────
       if (response.status === 403 || response.status === 429) {
         rateLimitRetries++;
         if (rateLimitRetries > MAX_RATE_LIMIT_RETRIES) {
-          console.error(`  [GitHub] Query ${queryIndex + 1}/${totalQueries}: rate-limit retries exhausted, moving on`);
+          console.error(
+            `  [GitHub] Q${queryIndex + 1}/${totalQueries} p${page}: ` +
+            `rate-limit retries exhausted, moving on`,
+          );
           break;
         }
-        const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
-        const waitMs = retryAfter > 0 ? retryAfter * 1000 : RATE_LIMIT_BACKOFF_MS;
-        console.error(`  [GitHub] Rate limited (${response.status}), waiting ${Math.round(waitMs / 1000)}s (retry ${rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES})…`);
+        const retryAfter = parseInt(
+          response.headers.get('retry-after') || '0', 10,
+        );
+        const waitMs = retryAfter > 0
+          ? retryAfter * 1000
+          : RATE_LIMIT_BACKOFF_MS;
+        console.error(
+          `  [GitHub] Rate limited (${response.status}), ` +
+          `waiting ${Math.round(waitMs / 1000)}s ` +
+          `(retry ${rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES})…`,
+        );
         await this.sleep(waitMs);
-        continue; // Retry the same page
+        continue; // retry the same page
       }
 
       if (!response.ok) {
@@ -196,37 +237,31 @@ export class GitHubSource {
         throw new Error(`GitHub API ${response.status}: ${text.slice(0, 200)}`);
       }
 
+      // ── Success path ─────────────────────────────────────────
+      rateLimitRetries = 0; // reset on success
       const data = await response.json() as GitHubSearchResult;
       allTools.push(...this.mapItems(data.items));
 
-      // Check remaining rate limit
-      const remaining = parseInt(response.headers.get('x-ratelimit-remaining') || '999', 10);
-      if (remaining <= 1) {
-        const resetAt = parseInt(response.headers.get('x-ratelimit-reset') || '0', 10);
-        const waitMs = resetAt > 0 ? (resetAt * 1000 - Date.now() + 1000) : RATE_LIMIT_BACKOFF_MS;
-        if (waitMs > 0) {
-          console.error(`  [GitHub] Rate limit nearly exhausted (${remaining} left), waiting ${Math.round(waitMs / 1000)}s…`);
-          await this.sleep(waitMs);
-        }
-      }
-
-      // Stop if we've exhausted all results for this query
+      // Are we done with this query?
       if (data.items.length < PER_PAGE || allTools.length >= data.total_count) {
         break;
       }
 
       page++;
 
-      // Throttle between pages
-      await this.sleep(SEARCH_DELAY_MS);
+      // Dynamic pacing based on remaining rate-limit budget
+      const delay = this.rateLimitDelay(response.headers);
+      if (delay > 0) {
+        await this.sleep(delay);
+      }
     }
 
     return allTools;
   }
 
   /**
-   * Map raw GitHub search items to DiscoveredTool objects.
-   * Lightweight — no extra API calls.
+   * Map raw GitHub search items to lightweight DiscoveredTool objects.
+   * No extra API calls.
    */
   private mapItems(items: GitHubSearchResult['items']): DiscoveredTool[] {
     return items.map(item => ({
@@ -240,31 +275,33 @@ export class GitHubSource {
       homepage: item.homepage || undefined,
       repository: item.html_url,
       stars: item.stargazers_count,
-      hasMCPSupport: item.topics?.includes('mcp') || 
-                     item.name.includes('mcp') ||
-                     item.description?.toLowerCase().includes('mcp') || false,
-      hasNpmPackage: item.topics?.includes('npm') ||
-                     item.topics?.includes('nodejs') || false,
+      hasMCPSupport:
+        item.topics?.includes('mcp') ||
+        item.name.toLowerCase().includes('mcp') ||
+        (item.description?.toLowerCase().includes('mcp') ?? false),
+      hasNpmPackage:
+        item.topics?.includes('npm') ||
+        item.topics?.includes('nodejs') || false,
     }));
   }
 
   /**
-   * Enrich a tool with README + package.json data (expensive — 2 API calls per tool).
-   * Call AFTER filtering to avoid burning rate limit on irrelevant repos.
+   * Enrich a tool with README + package.json data (expensive — 2 API calls
+   * per tool).  Call AFTER filtering to avoid burning rate limit on
+   * irrelevant repos.
    */
   async enrichTool(tool: DiscoveredTool): Promise<DiscoveredTool> {
-    const repoFullName = tool.repository?.replace('https://github.com/', '') || '';
+    const repoFullName =
+      tool.repository?.replace('https://github.com/', '') || '';
     if (!repoFullName) return tool;
 
     try {
       const [readme, packageJson] = await Promise.all([
         this.getFileContent(repoFullName, 'README.md').catch(() => null),
-        this.getFileContent(repoFullName, 'package.json').catch(() => null)
+        this.getFileContent(repoFullName, 'package.json').catch(() => null),
       ]);
 
-      if (readme) {
-        tool.readme = readme;
-      }
+      if (readme) tool.readme = readme;
 
       if (packageJson) {
         try {
@@ -272,16 +309,15 @@ export class GitHubSource {
           tool.hasNpmPackage = true;
 
           const pkg = tool.packageJson as Record<string, unknown>;
-          const deps = { 
+          const deps = {
             ...(pkg.dependencies as Record<string, string> || {}),
-            ...(pkg.devDependencies as Record<string, string> || {})
+            ...(pkg.devDependencies as Record<string, string> || {}),
           };
-
           if (deps['@modelcontextprotocol/sdk']) {
             tool.hasMCPSupport = true;
           }
         } catch {
-          // Ignore parse errors
+          // Ignore JSON parse errors
         }
       }
     } catch {
@@ -290,39 +326,36 @@ export class GitHubSource {
 
     return tool;
   }
-  
-  private async getFileContent(repo: string, path: string): Promise<string | null> {
+
+  private async getFileContent(
+    repo: string,
+    path: string,
+  ): Promise<string | null> {
     const url = `${GITHUB_API}/repos/${repo}/contents/${path}`;
-    
     const response = await fetch(url, { headers: this.headers });
-    
-    if (!response.ok) {
-      return null;
-    }
-    
-    const data = await response.json() as GitHubContent;
-    
+
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as GitHubContent;
     if (data.encoding === 'base64') {
       return Buffer.from(data.content, 'base64').toString('utf-8');
     }
-    
     return null;
   }
-  
+
   /**
-   * Get a specific repo as a discovered tool (with enrichment).
+   * Get a specific repo as a discovered tool (with full enrichment).
    */
-  async getRepo(owner: string, repo: string): Promise<DiscoveredTool | null> {
+  async getRepo(
+    owner: string,
+    repo: string,
+  ): Promise<DiscoveredTool | null> {
     const url = `${GITHUB_API}/repos/${owner}/${repo}`;
-    
     const response = await fetch(url, { headers: this.headers });
-    
-    if (!response.ok) {
-      return null;
-    }
-    
+
+    if (!response.ok) return null;
+
     const item = await response.json();
-    
     const tool: DiscoveredTool = {
       id: `github:${item.full_name}`,
       name: item.name,
@@ -334,19 +367,19 @@ export class GitHubSource {
       homepage: item.homepage || undefined,
       repository: item.html_url,
     };
-    
-    // Fetch README and package.json
+
     const [readme, packageJson] = await Promise.all([
       this.getFileContent(item.full_name, 'README.md').catch(() => null),
-      this.getFileContent(item.full_name, 'package.json').catch(() => null)
+      this.getFileContent(item.full_name, 'package.json').catch(() => null),
     ]);
-    
+
     if (readme) {
       tool.readme = readme;
-      tool.hasMCPSupport = readme.toLowerCase().includes('mcp') ||
-                           readme.includes('@modelcontextprotocol');
+      tool.hasMCPSupport =
+        readme.toLowerCase().includes('mcp') ||
+        readme.includes('@modelcontextprotocol');
     }
-    
+
     if (packageJson) {
       try {
         tool.packageJson = JSON.parse(packageJson);
@@ -355,7 +388,7 @@ export class GitHubSource {
         // Ignore
       }
     }
-    
+
     return tool;
   }
 }

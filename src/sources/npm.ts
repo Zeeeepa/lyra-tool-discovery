@@ -9,11 +9,12 @@ const NPM_SEARCH = 'https://registry.npmjs.org/-/v1/search';
  */
 const NPM_PAGE_SIZE = 250;
 
-/** Delay between npm API requests to be polite and avoid 429s */
-const NPM_DELAY_MS = 1_500;
+/** Delay between requests — npm registry is strict on rate limits */
+const NPM_MIN_DELAY_MS = 1_000;
+const NPM_INTER_QUERY_DELAY_MS = 2_000;
 
 /** Backoff when rate-limited */
-const NPM_RATE_LIMIT_BACKOFF_MS = 10_000;
+const NPM_RATE_LIMIT_BACKOFF_MS = 30_000;
 const NPM_MAX_RETRIES = 3;
 
 interface NpmSearchResult {
@@ -57,7 +58,7 @@ export class NpmSource {
   /**
    * Search npm for MCP servers — **exhaustively**.
    *
-   * Every search term is queried. Every page is fetched.
+   * Every search term is queried.  Every page is fetched.
    * Results are deduplicated by package name.
    * There is NO cap — the caller receives everything npm returns.
    *
@@ -76,7 +77,6 @@ export class NpmSource {
         ];
 
     const queries = [
-      // MCP packages with category focus
       ...terms.map(term => `mcp ${term.split(' ')[0]}`),
       ...terms.map(term => `mcp-server ${term.split(' ')[0]}`),
       ...terms.map(term => `modelcontextprotocol ${term.split(' ')[0]}`),
@@ -87,7 +87,6 @@ export class NpmSource {
 
     console.log(`  [npm] Running ${queries.length} queries (exhaustive, all pages)…`);
 
-    // Run EVERY query, fetch ALL pages — no early break.
     for (let qi = 0; qi < queries.length; qi++) {
       const query = queries[qi];
       try {
@@ -103,9 +102,9 @@ export class NpmSource {
         console.error(`  [npm] Query ${qi + 1}/${queries.length} failed: ${msg}`);
       }
 
-      // Throttle between queries to avoid 429
+      // Polite delay between queries to avoid npm rate limits
       if (qi < queries.length - 1) {
-        await this.sleep(NPM_DELAY_MS);
+        await this.sleep(NPM_INTER_QUERY_DELAY_MS);
       }
     }
 
@@ -128,7 +127,9 @@ export class NpmSource {
     let retries = 0;
 
     while (true) {
-      const url = `${NPM_SEARCH}?text=${encodeURIComponent(query)}&size=${NPM_PAGE_SIZE}&from=${from}`;
+      const url =
+        `${NPM_SEARCH}?text=${encodeURIComponent(query)}` +
+        `&size=${NPM_PAGE_SIZE}&from=${from}`;
 
       const response = await fetch(url);
 
@@ -136,22 +137,31 @@ export class NpmSource {
       if (response.status === 429) {
         retries++;
         if (retries > NPM_MAX_RETRIES) {
-          console.error(`  [npm] Query ${queryIndex + 1}/${totalQueries}: rate-limit retries exhausted`);
+          console.error(
+            `  [npm] Q${queryIndex + 1}/${totalQueries}: ` +
+            `rate-limit retries exhausted`,
+          );
           break;
         }
-        const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
-        const waitMs = retryAfter > 0 ? retryAfter * 1000 : NPM_RATE_LIMIT_BACKOFF_MS;
-        console.error(`  [npm] Rate limited (429), waiting ${Math.round(waitMs / 1000)}s (retry ${retries}/${NPM_MAX_RETRIES})…`);
+        const retryAfter = parseInt(
+          response.headers.get('retry-after') || '0', 10,
+        );
+        const waitMs = retryAfter > 0
+          ? retryAfter * 1000
+          : NPM_RATE_LIMIT_BACKOFF_MS;
+        console.error(
+          `  [npm] Rate limited (429), waiting ${Math.round(waitMs / 1000)}s ` +
+          `(retry ${retries}/${NPM_MAX_RETRIES})…`,
+        );
         await this.sleep(waitMs);
-        continue; // Retry the same page
+        continue; // retry same page
       }
 
       if (!response.ok) {
         throw new Error(`npm search error: ${response.status}`);
       }
 
-      // Reset retry counter on successful response
-      retries = 0;
+      retries = 0; // reset on success
 
       const data = await response.json() as NpmSearchResult;
 
@@ -163,24 +173,29 @@ export class NpmSource {
           description: pkg.description || '',
           source: 'npm',
           sourceUrl: pkg.links.npm,
-          author: typeof pkg.author === 'string' ? pkg.author : pkg.author?.name,
+          author: typeof pkg.author === 'string'
+            ? pkg.author
+            : pkg.author?.name,
           homepage: pkg.links.homepage,
           repository: pkg.links.repository,
           hasNpmPackage: true,
-          hasMCPSupport: pkg.keywords?.includes('mcp') || 
-                         pkg.name.includes('mcp') ||
-                         pkg.description?.toLowerCase().includes('mcp') || false,
+          hasMCPSupport:
+            pkg.keywords?.includes('mcp') ||
+            pkg.name.includes('mcp') ||
+            (pkg.description?.toLowerCase().includes('mcp') ?? false),
         });
       }
 
       // Stop if we've exhausted all results
-      if (data.objects.length < NPM_PAGE_SIZE || allTools.length >= data.total) {
+      if (
+        data.objects.length < NPM_PAGE_SIZE ||
+        allTools.length >= data.total
+      ) {
         break;
       }
       from += NPM_PAGE_SIZE;
 
-      // Throttle between pages
-      await this.sleep(NPM_DELAY_MS);
+      await this.sleep(NPM_MIN_DELAY_MS);
     }
 
     return allTools;
@@ -188,7 +203,7 @@ export class NpmSource {
 
   /**
    * Enrich a tool with full npm package metadata (bin, deps, readme).
-   * Expensive — 1 API call per package. Call AFTER filtering.
+   * Expensive — 1 API call per package.  Call AFTER filtering.
    */
   async enrichTool(tool: DiscoveredTool): Promise<DiscoveredTool> {
     const fullPkg = await this.getPackage(tool.name).catch(() => null);
@@ -197,65 +212,51 @@ export class NpmSource {
     tool.license = fullPkg.license;
     tool.packageJson = fullPkg as unknown as Record<string, unknown>;
 
-    if (fullPkg.readme) {
-      tool.readme = fullPkg.readme;
-    }
+    if (fullPkg.readme) tool.readme = fullPkg.readme;
 
-    // Check for MCP SDK dependency
     if (fullPkg.dependencies?.['@modelcontextprotocol/sdk']) {
       tool.hasMCPSupport = true;
     }
 
-    // If it has a bin, it's likely a CLI tool (STDIO MCP)
     if (fullPkg.bin) {
       tool.mcpConfig = {
         type: 'stdio',
         command: 'npx',
         args: ['-y', fullPkg.name],
-        env: {}
+        env: {},
       };
     }
 
     return tool;
   }
-  
+
   private async getPackage(name: string): Promise<NpmPackage | null> {
     const url = `${NPM_REGISTRY}/${encodeURIComponent(name)}`;
-    
     const response = await fetch(url);
-    
-    if (!response.ok) {
-      return null;
-    }
-    
+
+    if (!response.ok) return null;
+
     const data = await response.json();
-    
-    // Get latest version
     const latest = data['dist-tags']?.latest;
     if (latest && data.versions?.[latest]) {
-      return {
-        ...data.versions[latest],
-        readme: data.readme
-      };
+      return { ...data.versions[latest], readme: data.readme };
     }
-    
     return data;
   }
-  
+
   /**
    * Get a specific package as a discovered tool (with enrichment).
    */
   async getPackageAsTool(name: string): Promise<DiscoveredTool | null> {
     const pkg = await this.getPackage(name);
-    
-    if (!pkg) {
-      return null;
-    }
-    
-    const repoUrl = typeof pkg.repository === 'string' 
-      ? pkg.repository 
-      : pkg.repository?.url?.replace(/^git\+/, '').replace(/\.git$/, '');
-    
+    if (!pkg) return null;
+
+    const repoUrl = typeof pkg.repository === 'string'
+      ? pkg.repository
+      : pkg.repository?.url
+          ?.replace(/^git\+/, '')
+          .replace(/\.git$/, '');
+
     const tool: DiscoveredTool = {
       id: `npm:${pkg.name}`,
       name: pkg.name,
@@ -263,28 +264,29 @@ export class NpmSource {
       source: 'npm',
       sourceUrl: `https://www.npmjs.com/package/${pkg.name}`,
       license: pkg.license,
-      author: typeof pkg.author === 'string' ? pkg.author : pkg.author?.name,
+      author: typeof pkg.author === 'string'
+        ? pkg.author
+        : pkg.author?.name,
       homepage: pkg.homepage,
       repository: repoUrl,
       hasNpmPackage: true,
-      hasMCPSupport: pkg.keywords?.includes('mcp') ||
-                     pkg.name.includes('mcp') ||
-                     pkg.dependencies?.['@modelcontextprotocol/sdk'] !== undefined,
+      hasMCPSupport:
+        pkg.keywords?.includes('mcp') ||
+        pkg.name.includes('mcp') ||
+        pkg.dependencies?.['@modelcontextprotocol/sdk'] !== undefined,
       packageJson: pkg as unknown as Record<string, unknown>,
-      readme: pkg.readme
+      readme: pkg.readme,
     };
-    
-    // If it has a bin, suggest STDIO config
+
     if (pkg.bin) {
       tool.mcpConfig = {
         type: 'stdio',
         command: 'npx',
         args: ['-y', pkg.name],
-        env: {}
+        env: {},
       };
     }
-    
+
     return tool;
   }
 }
-
