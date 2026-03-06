@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { ToolDiscovery } from './index.js';
+import { ToolDiscovery, listCategories, isValidCategory } from './index.js';
 import type { DiscoverySource } from './types.js';
 import type { AIProvider } from './ai.js';
 import { getAvailableProviders } from './ai.js';
@@ -9,19 +9,27 @@ const program = new Command();
 
 program
   .name('lyra-discover')
-  .description('Discover MCP tools and APIs, generate SperaxOS plugin configs')
-  .version('0.1.0');
+  .description('Discover MCP tools and APIs across categories, generate SperaxOS plugin configs')
+  .version('0.2.0');
 
 program
   .command('discover')
-  .description('Search for crypto/DeFi/blockchain/web3 MCP tools across sources')
+  .description('Search for MCP tools across sources for a given category')
   .option('-s, --sources <sources>', 'Comma-separated sources: github,npm', 'github,npm')
-  .option('-l, --limit <number>', 'Max tools to discover', '5')
+  .option('-l, --limit <number>', 'Max tools to analyze/display (fetching is always exhaustive)', '20')
   .option('-a, --max-age <months>', 'Max age in months (default: 12)', '12')
+  .option('-c, --category <category>', 'Category to discover (run "categories" to see all)', 'trading')
   .option('-d, --dry-run', 'List discovered tools without AI analysis')
   .option('-p, --provider <provider>', 'AI provider: openai or anthropic')
   .option('-m, --model <model>', 'AI model to use (e.g., gpt-4o, claude-sonnet-4-20250514)')
   .action(async (options) => {
+    // Validate category
+    if (!isValidCategory(options.category)) {
+      console.error(`❌ Unknown category: "${options.category}"`);
+      console.error(`Run "lyra-discover categories" to see available categories.`);
+      process.exit(1);
+    }
+
     const discovery = new ToolDiscovery({
       provider: options.provider as AIProvider,
       model: options.model
@@ -35,6 +43,7 @@ program
       sources,
       limit,
       maxAgeMonths,
+      category: options.category,
       dryRun: options.dryRun
     });
     
@@ -50,6 +59,24 @@ program
         console.log('');
       }
     }
+  });
+
+program
+  .command('categories')
+  .description('List all available discovery categories')
+  .action(() => {
+    const cats = listCategories();
+    console.log('\n🏷️  Available Discovery Categories\n');
+    console.log(`${'ID'.padEnd(22)} ${'Display Name'.padEnd(30)} Description`);
+    console.log('─'.repeat(90));
+    for (const cat of cats) {
+      console.log(
+        `${cat.id.padEnd(22)} ${cat.displayName.padEnd(30)} ${cat.description}`,
+      );
+    }
+    console.log(`\nTotal: ${cats.length} categories`);
+    console.log('\nUsage:  lyra-discover discover --category <id>');
+    console.log('Example: lyra-discover discover --category research --dry-run\n');
   });
 
 program
